@@ -11,6 +11,7 @@ from pathlib import Path
 from collections import defaultdict as ddict
 import torch
 import time
+from Rfuns import bw_nrd0_R
 
 
 def mat2Tensor(dat, fs, bandsCuts=None, Nord=None, q=None):
@@ -57,6 +58,8 @@ def GetAmatArr(Y, X, times, freqs, downrates=1, hs=None):
         A d x d matrix, it is sum of dF x dT/downrates  A(s_i, t_i) matrix
     """
     d, dF, dT = X.shape
+    if hs is None:
+        hs = [bw_nrd0_R(freqs), bw_nrd0_R(times)]
     hF, hT = hs
     if len(downrates) == 1:
         DRF = DRT = downrates
@@ -107,6 +110,8 @@ def GetAmatTorch(Y, X, times, freqs, downrates=1, hs=None):
         A d x d matrix, it is sum of dF x dT/downrates  A(s_i, t_i) matrix
     """
     d, dF, dT = X.shape
+    if hs is None:
+        hs = [bw_nrd0_R(freqs), bw_nrd0_R(times)]
     hF, hT = hs
     if len(downrates) == 1:
         DRF = DRT = downrates
@@ -149,7 +154,7 @@ class OneStepOpt():
     """
         I concatenate the real and image part into one vector.
     """
-    def __init__(self, X, Y, pUinv, fixedParas, lastTheta, **paras):
+    def __init__(self, X, Y, pUinv, fixedParas, lastTheta, penalty="SCAD", is_ConGrad=False, is_std=None, **paras):
         """
          Input: 
              Y: A tensor with shape, d x dF x dT
@@ -159,6 +164,10 @@ class OneStepOpt():
                  when update \mu, 2R x dT
                  when update \nu, 2R x dF
              lastTheta: The parameters for optimizing at the last time step, initial parameters, vector of 2R(D-1), real data
+             penalty: The penalty type, "SCAD" or "GroupLasso"
+             is_ConGrad: Whether to use conjugate gradient method to update gamma or not. 
+                        When data are large, it is recommended to use it
+             is_std: Whether to std the gam and theta or not
              paras:
                  beta: tuning parameter for iteration
                  alp: tuning parameter for iteration
@@ -206,10 +215,28 @@ class OneStepOpt():
         self.a = self.paras.a 
         self.iterNum = self.paras.iterNum
         self.iterC = self.paras.iterC
+        self.penalty = penalty.lower()
+        if is_ConGrad is None:
+            is_ConGrad = self.D >= 1e3
+        self.is_ConGrad = is_ConGrad
+        if is_std is None:
+            is_std = self.D == self.dF
+        self.is_std = is_std
             
         self.leftMat = None
         self.leftMatVec = None
         self.NewXYR2Sum = None
+        self.lastThetaStd = None
+        
+        self.NewXr = None
+        self.NewYr = None
+        self.NewXi = None
+        self.NewYi = None
+        
+        self.GamMat = None
+        self.ThetaMat = None
+        self.GamMatStd = None
+        self.ThetaMatStd = None
         
     def obtainNewData(self):
         pY = self.Y.permute(1, 2, 0) # dF x dT x d
@@ -267,18 +294,18 @@ class OneStepOpt():
         optAxis = 1 if self.D == self.dF else 0
         
         if self.leftMat is None:
-            NewXSq = self.NewXr**2 + self.NewXi**2
+            NewXSq = self.NewXr**2 + self.NewXi**2 # dF x dT x R
             NewXSqR2 = torch.cat((NewXSq, NewXSq), dim=2) # dF x dT x 2R
             NewXSqR2Sum = NewXSqR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-            self.leftMat = torch.diag(NewXSqR2Sum.flatten()).to_sparse()/self.nD +  \
+            self.leftMat = torch.diag(NewXSqR2Sum.flatten()).to_sparse() +  \
                     self.paras.beta * self.DiffMatSq
         
         if self.NewXYR2Sum is None:
             NewXY1 = self.NewXr * self.NewYr + self.NewXi * self.NewYi
-            NewXY2 = -self.NewXi * self.NewYr + self.NewXr * self.NewYi
+            NewXY2 = - self.NewXi * self.NewYr + self.NewXr * self.NewYi
             NewXYR2 = torch.cat((NewXY1, NewXY2), dim=2) # dF x dT x 2R
             self.NewXYR2Sum = NewXYR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-        rightVec = self.NewXYR2Sum.flatten()/self.nD + \
+        rightVec = self.NewXYR2Sum.flatten() + \
                     DiffMatTOpt(self.rho + self.paras.beta * self.lastTheta, self.R2)
         
         # self.newVecGam, = torch.inverse(self.leftMat).matmul(rightVec)
@@ -296,14 +323,14 @@ class OneStepOpt():
             NewXSq = self.NewXr**2 + self.NewXi**2
             NewXSqR2 = torch.cat((NewXSq, NewXSq), dim=2) # dF x dT x 2R
             NewXSqR2Sum = NewXSqR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-            self.leftMatVecP1 = NewXSqR2Sum.flatten()/self.nD
+            self.leftMatVecP1 = NewXSqR2Sum.flatten()
         
         if self.NewXYR2Sum is None:
             NewXY1 = self.NewXr * self.NewYr + self.NewXi * self.NewYi
-            NewXY2 = -self.NewXi * self.NewYr + self.NewXr * self.NewYi
+            NewXY2 = - self.NewXi * self.NewYr + self.NewXr * self.NewYi
             NewXYR2 = torch.cat((NewXY1, NewXY2), dim=2) # dF x dT x 2R
             self.NewXYR2Sum = NewXYR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-        rightVec = self.NewXYR2Sum.flatten()/self.nD + \
+        rightVec = self.NewXYR2Sum.flatten() + \
                     DiffMatTOpt(self.rho + self.paras.beta * self.lastTheta, self.R2)
         
         self.newVecGam = self._ConjuGrad(rightVec)
@@ -341,6 +368,22 @@ class OneStepOpt():
         
         self.lastTheta = (tranHTheta*normCs.reshape(-1, 1)).flatten()
         
+    def updateThetaGL(self):
+        """
+            Update the vector Theta, third step with group lasso penalty
+        """
+        halfTheta = DiffMatOpt(self.newVecGam, self.R2) - self.halfRho/self.paras.beta
+        tranHTheta = halfTheta.reshape(-1, self.R2) # D-1 x 2R
+        hThetaL2Norm = tranHTheta.abs().square().sum(axis=1).sqrt() # D-1
+        
+        normC1 = hThetaL2Norm - self.lam
+        normC1[normC1<0] = 0
+        
+        normCs = normC1
+        
+        normCs[normC1!=0] = normC1[normC1!=0]/hThetaL2Norm[normC1!=0]
+        self.lastTheta = (tranHTheta*normCs.reshape(-1, 1)).flatten()
+        
     
     def updateRho(self):
         """
@@ -351,24 +394,46 @@ class OneStepOpt():
         
     
     def __call__(self, is_showProg=False, leave=False):
-        self.obtainNewData()
+        if self.NewXr is None:
+            self.obtainNewData()
         if self.iterC is None:
             self.iterC = 0
         
         chDiff = torch.tensor(1e10)
-        self.updateVecGamConGra()
+        
+        if self.is_ConGrad:
+            self.updateVecGamConGra()
+        else:
+            self.updateVecGam()
+            
         self.updateHRho()
-        self.updateTheta()
+        
+        if self.penalty.startswith("scad"):
+            self.updateTheta()
+        elif self.penalty.startswith("group"):
+            self.updateThetaGL()
+            
         self.updateRho()
+        
         lastVecGam = self.newVecGam
         if is_showProg:
             with tqdm(total=self.iterNum, leave=leave) as pbar:
                 for i in range(self.iterNum):
                     pbar.set_description(f"Inner Loop: The chdiff is {chDiff.item():.3e}.")
                     pbar.update(1)
-                    self.updateVecGamConGra()
+                    
+                    if self.is_ConGrad:
+                        self.updateVecGamConGra()
+                    else:
+                        self.updateVecGam()
+                        
                     self.updateHRho()
-                    self.updateTheta()
+                    
+                    if self.penalty.startswith("scad"):
+                        self.updateTheta()
+                    elif self.penalty.startswith("group"):
+                        self.updateThetaGL()
+                        
                     self.updateRho()
                     chDiff = torch.norm(self.newVecGam-lastVecGam)/torch.norm(lastVecGam)
                     lastVecGam = self.newVecGam
@@ -377,23 +442,47 @@ class OneStepOpt():
                         break
         else:
             for i in range(self.iterNum):
-                self.updateVecGamConGra()
+                if self.is_ConGrad:
+                    self.updateVecGamConGra()
+                else:
+                    self.updateVecGam()
+                    
                 self.updateHRho()
-                self.updateTheta()
+                
+                if self.penalty.startswith("scad"):
+                    self.updateTheta()
+                elif self.penalty.startswith("group"):
+                    self.updateThetaGL()
+                
                 self.updateRho()
                 chDiff = torch.norm(self.newVecGam-lastVecGam)/torch.norm(lastVecGam)
                 lastVecGam = self.newVecGam
                 if chDiff < self.iterC:
                     break
             
-        if self.D == self.dF:
+        self._post()
+            
+    def _post(self):
+        if self.is_std:
             R = int(self.R2/2)
             newGam = self.newVecGam.reshape(-1, self.R2) # D x 2R
+            theta = self.lastTheta.reshape(-1, self.R2)# (D-1) x 2R
+            
             newGamNorm2 = newGam.square().sum(axis=0) # 2R
             newGamNorm = torch.sqrt(newGamNorm2[:R] + newGamNorm2[R:])
             newGamNorm = torch.cat([newGamNorm, newGamNorm])
             newGam = newGam/newGamNorm
+            theta = theta/newGamNorm
             self.newVecGamStd = newGam.flatten()
+            self.lastThetaStd = theta.flatten()
+            
+            self.GamMat = colStackFn(self.newVecGam, self.R2)
+            self.GamMatStd = colStackFn(self.newVecGamStd, self.R2)
+            self.ThetaMat = colStackFn(self.lastTheta, self.R2)
+            self.ThetaMatStd = colStackFn(self.lastThetaStd, self.R2)
+        else:
+            self.GamMat = colStackFn(self.newVecGam, self.R2)
+            self.ThetaMat = colStackFn(self.lastTheta, self.R2)
 
 
 class TVDNextOpt():
@@ -479,6 +568,9 @@ class TVDNextOpt():
         _, self.dF, self.dT = self.Y.shape
         times = np.linspace(0, self.T, self.dT)
         freqs = np.array([np.mean(bandCut) for bandCut in self.paras.bandsCuts])
+        if self.hs is None:
+            self.hs = [bw_nrd0_R(freqs), bw_nrd0_R(times)]
+        
         self.Amat = GetAmatTorch(self.Y, self.X, times, freqs, self.paras.downrates, self.hs)
         
         res = np.linalg.eig(self.Amat)
@@ -491,7 +583,9 @@ class TVDNextOpt():
         
         eigF = np.concatenate([[np.inf], lams])
         # To remove conjugate eigvector
-        self.kpidx = np.where(np.diff(np.abs(eigF))[:self.Rn] != 0)[0] 
+        # self.kpidx = np.where(np.diff(np.abs(eigF))[:self.Rn] != 0)[0] 
+        # Only for test
+        self.kpidx = np.arange(self.Rn) 
         self.R = len(self.kpidx)
         self.R2 = 2 * self.R
         
@@ -533,22 +627,32 @@ class TVDNextOpt():
         
         pbar = tqdm(range(self.paras.maxIter))
         for i in pbar:
-            pbar.set_description(f"Outer Loop: The chdiff is {chDiffBoth.item():.3e}.")
+            if i == 0:
+                pbar.set_description(f"Outer Loop: The chdiff is {chDiffBoth.item():.3e}.")
+            else:
+                pbar.set_description(f"Outer Loop:"
+                                     f"{chDiffMu.item():.3e}, "
+                                     f"{chDiffNu.item():.3e}, "
+                                     f"{chDiffBoth.item():.3e}.")
             optMu = OneStepOpt(X=self.X, Y=self.Y, pUinv=self.pUinv, fixedParas=fixedNuMat, lastTheta=lastMuTheta, 
                                alp=self.paras.alps[0], beta=self.paras.betas[0], lam=self.paras.lams[0], 
                                a=self.paras.As[0], iterNum=self.paras.iterNums[0], rho=self.paras.rhos[0], iterC=self.paras.iterCs[0])
             optMu(showSubProg)
             
-            fixedMuMat = colStackFn(optMu.newVecGamStd, self.R2)
-            lastNuTheta = DiffMatOpt(colStackFn(fixedNuMat), self.R2)
+            fixedMuMat = optMu.GamMatStd
+            if i == 0:
+                lastNuTheta = DiffMatOpt(colStackFn(fixedNuMat), self.R2)
+            else:
+                lastNuTheta = optNu.lastTheta
             
             optNu = OneStepOpt(X=self.X, Y=self.Y, pUinv=self.pUinv, fixedParas=fixedMuMat, lastTheta=lastNuTheta, 
                                alp=self.paras.alps[1], beta=self.paras.betas[1], lam=self.paras.lams[1], 
                                a=self.paras.As[1], iterNum=self.paras.iterNums[1], rho=self.paras.rhos[1], iterC=self.paras.iterCs[1])
             optNu(showSubProg)
             
-            fixedNuMat = colStackFn(optNu.newVecGam, self.R2)
-            lastMuTheta = DiffMatOpt(colStackFn(fixedMuMat), self.R2)
+            fixedNuMat = optNu.GamMat
+            # lastMuTheta = DiffMatOpt(colStackFn(fixedMuMat), self.R2)
+            lastMuTheta = optMu.lastThetaStd
             
             chDiffMu = torch.norm(stopLastMuMat-fixedMuMat)/torch.norm(stopLastMuMat)
             chDiffNu = torch.norm(stopLastNuMat-fixedNuMat)/torch.norm(stopLastNuMat)
@@ -634,3 +738,6 @@ def colStackFn(a, R=None):
     elif a.dim() == 1:
         out = a.reshape(-1, R).permute((1, 0))
     return out
+# -
+
+
