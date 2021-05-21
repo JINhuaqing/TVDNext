@@ -97,7 +97,7 @@ def GetAmatArr(Y, X, times, freqs, downrates=1, hs=None):
 if torch.cuda.is_available():
     torch.set_default_tensor_type(torch.cuda.DoubleTensor)
 
-def GetAmatTorch(Y, X, times, freqs, downrates=1, hs=None):
+def GetAmatTorch(Y, X, times, freqs, downrates=[1], hs=None):
     """
     Input: 
         Y: A tensor with shape, d x dF x dT
@@ -237,15 +237,16 @@ class OneStepOpt():
         self.ThetaMat = None
         self.GamMatStd = None
         self.ThetaMatStd = None
+        self.numEs = 1
         
     def obtainNewData(self):
         pY = self.Y.permute(1, 2, 0) # dF x dT x d
         pX = self.X.permute(1, 2, 0)
-        cNewX = pX.matmul(self.pUinv.T)  # dF x dT x R
+        cNewY = pY.matmul(self.pUinv.T)
         if self.D == self.dF:
-            cNewY = pY.matmul(self.pUinv.T) * (1/self.fixedParas.T) # dF x dT x R
+            cNewX = pX.matmul(self.pUinv.T) * (self.fixedParas.T) # dF x dT x R
         else:
-            cNewY = pY.matmul(self.pUinv.T) * (1/self.fixedParas.T).unsqueeze(1) # dF x dT x R
+            cNewX = pX.matmul(self.pUinv.T) * (self.fixedParas.T).unsqueeze(1) # dF x dT x R
         self.NewXr = cNewX.real
         self.NewYr = cNewY.real
         self.NewXi = cNewX.imag
@@ -297,7 +298,7 @@ class OneStepOpt():
             NewXSq = self.NewXr**2 + self.NewXi**2 # dF x dT x R
             NewXSqR2 = torch.cat((NewXSq, NewXSq), dim=2) # dF x dT x 2R
             NewXSqR2Sum = NewXSqR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-            self.leftMat = torch.diag(NewXSqR2Sum.flatten()).to_sparse() +  \
+            self.leftMat = torch.diag(NewXSqR2Sum.flatten()/self.numEs).to_sparse() +  \
                     self.paras.beta * self.DiffMatSq
         
         if self.NewXYR2Sum is None:
@@ -305,7 +306,7 @@ class OneStepOpt():
             NewXY2 = - self.NewXi * self.NewYr + self.NewXr * self.NewYi
             NewXYR2 = torch.cat((NewXY1, NewXY2), dim=2) # dF x dT x 2R
             self.NewXYR2Sum = NewXYR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-        rightVec = self.NewXYR2Sum.flatten() + \
+        rightVec = self.NewXYR2Sum.flatten()/self.numEs + \
                     DiffMatTOpt(self.rho + self.paras.beta * self.lastTheta, self.R2)
         
         # self.newVecGam, = torch.inverse(self.leftMat).matmul(rightVec)
@@ -323,14 +324,14 @@ class OneStepOpt():
             NewXSq = self.NewXr**2 + self.NewXi**2
             NewXSqR2 = torch.cat((NewXSq, NewXSq), dim=2) # dF x dT x 2R
             NewXSqR2Sum = NewXSqR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-            self.leftMatVecP1 = NewXSqR2Sum.flatten()
+            self.leftMatVecP1 = NewXSqR2Sum.flatten()/self.numEs
         
         if self.NewXYR2Sum is None:
             NewXY1 = self.NewXr * self.NewYr + self.NewXi * self.NewYi
             NewXY2 = - self.NewXi * self.NewYr + self.NewXr * self.NewYi
             NewXYR2 = torch.cat((NewXY1, NewXY2), dim=2) # dF x dT x 2R
             self.NewXYR2Sum = NewXYR2.sum(axis=optAxis) # dF x 2R or dT x 2R
-        rightVec = self.NewXYR2Sum.flatten() + \
+        rightVec = self.NewXYR2Sum.flatten()/self.numEs + \
                     DiffMatTOpt(self.rho + self.paras.beta * self.lastTheta, self.R2)
         
         self.newVecGam = self._ConjuGrad(rightVec)
@@ -464,15 +465,17 @@ class OneStepOpt():
             
     def _post(self):
         if self.is_std:
-            R = int(self.R2/2)
             newGam = self.newVecGam.reshape(-1, self.R2) # D x 2R
             theta = self.lastTheta.reshape(-1, self.R2)# (D-1) x 2R
             
-            newGamNorm2 = newGam.square().sum(axis=0) # 2R
-            newGamNorm = torch.sqrt(newGamNorm2[:R] + newGamNorm2[R:])
+            # Set the imag part of the first vec as zero
+            res = IdenOpt(newGam.T)
+            newGam = res["mat"].T
+            newGamNorm = res["matCN"]
             newGamNorm = torch.cat([newGamNorm, newGamNorm])
-            newGam = newGam/newGamNorm
+            
             theta = theta/newGamNorm
+            
             self.newVecGamStd = newGam.flatten()
             self.lastThetaStd = theta.flatten()
             
@@ -738,6 +741,20 @@ def colStackFn(a, R=None):
     elif a.dim() == 1:
         out = a.reshape(-1, R).permute((1, 0))
     return out
-# -
 
+
+# -
+def IdenOpt(mat):
+    """
+    To impose the identifiability constraints on mat
+    mat: The matrix with shape 2R x D
+    """
+    R2, D = mat.shape
+    R = int(R2/2)
+    matC = torch.complex(mat[:R, :], mat[R:, :])
+    matC[:, 0].imag = torch.zeros(R)
+    matCN = torch.norm(matC, dim=1)
+    nMatC = matC/matCN.reshape(-1, 1)
+    nMat = torch.cat([nMatC.real, nMatC.imag])
+    return {"matC":nMatC, "mat":nMat, "matCN": matCN}
 
