@@ -119,17 +119,23 @@ def GetAmatTorch(Y, X, times, freqs, downrates=[1], hs=None):
         DRF, DRT = downrates
         
     Ytrans = Y.permute((1, 2, 0))
-    # Xtrans = torch.tensor(np.transpose(X, (1, 2, 0)))
     Xtrans = X.permute((1, 2, 0))
+    
+    nF, nT = int(dF/DRF), int(dT/DRT)
         
     Amat = torch.zeros(d, d)
-    for idxf, fs in enumerate(freqs[::DRF]):
-        for idxt, ts in enumerate(times[::DRT]):
+    
+    fss = np.random.choice(freqs, size=nF, replace=False)
+    tss = np.random.choice(times, size=nT, replace=False)
+    for fs in fss:
+        for ts in tss:
             t_diff = times - ts
             freqs_diff = freqs- fs
             
-            kernelst = 1/np.sqrt(2*np.pi) * np.exp(-t_diff**2/2/hT**2) # normal_pdf(x/h)
-            kernelsf = 1/np.sqrt(2*np.pi) * np.exp(-freqs_diff**2/2/hF**2) # normal_pdf(x/h)
+            # kernelst = 1/np.sqrt(2*np.pi) * np.exp(-t_diff**2/2/hT**2) # normal_pdf(x/h)
+            # kernelsf = 1/np.sqrt(2*np.pi) * np.exp(-freqs_diff**2/2/hF**2) # normal_pdf(x/h)
+            kernelst = EpKernel(t_diff, hT)
+            kernelsf = EpKernel(freqs_diff, hF)
             kernelst = torch.tensor(kernelst)
             kernelsf = torch.tensor(kernelsf)
             
@@ -143,7 +149,13 @@ def GetAmatTorch(Y, X, times, freqs, downrates=[1], hs=None):
             M = kerXmat.T.mm(kerXmat)/dF/dT
             XY = kerYmat.T.mm(kerXmat)/dF/dT
             
-            invM = torch.inverse(M)
+            mU, mS, mV = torch.svd(M)
+            vs = torch.cumsum(mS, dim=0)/torch.sum(mS)>0.999
+            vs = vs.float()
+            r = torch.argmax(vs) + 1
+            invM = mU[:, :r].matmul(torch.diag(1/mS[:r])).matmul(mV.T[:r, :])
+            # invM = torch.inverse(M) # first way is better
+            
             Amat = Amat + XY.mm(invM)
     return np.array(Amat.cpu())
 
@@ -586,9 +598,9 @@ class TVDNextOpt():
         
         eigF = np.concatenate([[np.inf], lams])
         # To remove conjugate eigvector
-        # self.kpidx = np.where(np.diff(np.abs(eigF))[:self.Rn] != 0)[0] 
+        self.kpidx = np.where(np.diff(np.abs(eigF))[:self.Rn] != 0)[0] 
         # Only for test
-        self.kpidx = np.arange(self.Rn) 
+        # self.kpidx = np.arange(self.Rn) 
         self.R = len(self.kpidx)
         self.R2 = 2 * self.R
         
@@ -758,3 +770,9 @@ def IdenOpt(mat):
     nMat = torch.cat([nMatC.real, nMatC.imag])
     return {"matC":nMatC, "mat":nMat, "matCN": matCN}
 
+
+def EpKernel(x, h=1):
+    xh = x/h
+    rv = 3/4/h * (1-xh**2)
+    rv[np.abs(xh)>1] = 0
+    return rv

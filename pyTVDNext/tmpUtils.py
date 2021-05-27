@@ -56,6 +56,20 @@ def GenFVecs(nR, eigInd, ChgsF):
     fVecs = np.array(fVecsList)
     return fVecs.reshape(-1, nR).T
     
-# -
 
+
+# -
+def matchU(eU, U):
+    nrow, p = eU.shape
+    absU = np.abs(U)
+    ordList = []
+    kpIdxs = list(range(nrow))
+    
+    for i in range(nrow):
+        cVec = np.abs(eU[i, :])
+        cDiff = cVec.reshape(-1, p) - absU[np.array(kpIdxs), :]
+        cIdx = np.array(kpIdxs)[np.argmin((cDiff**2).sum(axis=1))]
+        ordList.append(cIdx)
+        kpIdxs.remove(cIdx)
+    return np.array(ordList)
 
