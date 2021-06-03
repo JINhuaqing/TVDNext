@@ -229,7 +229,7 @@ class OneStepOpt():
         self.iterC = self.paras.iterC
         self.penalty = penalty.lower()
         if is_ConGrad is None:
-            is_ConGrad = self.D >= 1e3
+            is_ConGrad = self.D >= 2e3
         self.is_ConGrad = is_ConGrad
         if is_std is None:
             is_std = self.D == self.dF
@@ -513,6 +513,8 @@ class TVDNextOpt():
              Rn: The nominal rank of A mat, Rn << d to reduce the computational burden 
              hs: the bandwidths for the kernel regression whe estimating A matrix
              paras:
+                 is_ConGrads: Whether use conjugate gradient descend or not in the inner loop
+                 penaltys: The penalty in the inner loop
                For Preprocess:
                  is_detrend: Whether detrend the raw data or not
                  bandsCuts: the cirtical freqs to use
@@ -537,7 +539,7 @@ class TVDNextOpt():
                  maxIter: Integer, the maximal times of iteration for the outer loop
                  outIterC:  decimal, stopping rule for the outer loop
         """
-        parasDefVs = {
+        parasDefVs = { "penaltys": ["SCAD", "SCAD"], "is_ConGrads":[False, True],
                       "is_detrend": True, "bandsCuts": [[2, 3.5], [4, 7], [8, 12], [13, 30], [30, 80]], 
                       "Nord": None, "q": 10, 
                       "downrates": [1, 10],  "betas":[1, 1], "alps": [0.9, 0.9],  "rhos": None,  "lams": None, 
@@ -650,6 +652,7 @@ class TVDNextOpt():
                                      f"{chDiffNu.item():.3e}, "
                                      f"{chDiffBoth.item():.3e}.")
             optMu = OneStepOpt(X=self.X, Y=self.Y, pUinv=self.pUinv, fixedParas=fixedNuMat, lastTheta=lastMuTheta, 
+                               penalty=self.paras.penaltys[0], is_ConGrad=self.paras.is_ConGrads[0],
                                alp=self.paras.alps[0], beta=self.paras.betas[0], lam=self.paras.lams[0], 
                                a=self.paras.As[0], iterNum=self.paras.iterNums[0], rho=self.paras.rhos[0], iterC=self.paras.iterCs[0])
             optMu(showSubProg)
@@ -661,6 +664,7 @@ class TVDNextOpt():
                 lastNuTheta = optNu.lastTheta
             
             optNu = OneStepOpt(X=self.X, Y=self.Y, pUinv=self.pUinv, fixedParas=fixedMuMat, lastTheta=lastNuTheta, 
+                               penalty=self.paras.penaltys[1], is_ConGrad=self.paras.is_ConGrads[1],
                                alp=self.paras.alps[1], beta=self.paras.betas[1], lam=self.paras.lams[1], 
                                a=self.paras.As[1], iterNum=self.paras.iterNums[1], rho=self.paras.rhos[1], iterC=self.paras.iterCs[1])
             optNu(showSubProg)
