@@ -1,4 +1,52 @@
 import numpy as np
+from easydict import EasyDict as edict
+
+timeLims = edict()
+timeLims.st02 = [35, 95]
+timeLims.st03 = [20, 80]
+
+
+# +
+def supInfDist(set1, set2):
+    if len(set2) == 0:
+        dist = 0
+    elif len(set1) == 0:
+        dist = np.max(set2)
+    else:
+        set1 = np.array(set1)
+        set2 = np.array(set2)
+        dist = np.abs(set1 - set2.reshape(-1, 1)).min(axis=1).max()
+    return dist
+
+# Compute the Hausdorff distance between two change point sets
+def hdist(set1, set2):
+    dist1 = supInfDist(set1, set2)
+    dist2 = supInfDist(set2, set1)
+    return np.max((dist1, dist2))
+
+# load the gt for MEG--Eye data
+def txt2Time(txtF):   
+    with open(txtF, "r") as f:
+        data = f.readlines() 
+    data = data[1:]
+    data = [i.strip().split("(") for i in data]
+    data = [float(i[0]) for i in data if len(i)>1]
+    return data
+
+# Time to change points
+def time2pts(ts, lims, Up=7200):
+    ts = np.array(ts)
+    timeC = 60
+    ts = ts[ts>=lims[0]]
+    ts = ts[ts<=lims[1]]
+    ts = ts - lims[0]
+    cpts = ts*Up/timeC
+    cpts = cpts.astype(np.int)
+    
+    res = edict()
+    res.ts = ts
+    res.cpts = cpts
+    return res
 
 
 # +

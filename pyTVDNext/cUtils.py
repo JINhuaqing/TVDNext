@@ -11,10 +11,10 @@ from pathlib import Path
 from collections import defaultdict as ddict
 import torch
 import time
-from Rfuns import bw_nrd0_R
+from Rfuns import bw_nrd0_R, smooth_spline_R
 
 
-def mat2Tensor(dat, fs, bandsCuts=None, Nord=None, q=None):
+def mat2Tensor(dat, fs, bandsCuts=None, Nord=None, q=None, is_raw=True):
     """
     To do filter on the intial data which would yeild a 3-mode tensor with shape d x dF x dT
     dF: the length along the frequeny mode
@@ -24,6 +24,7 @@ def mat2Tensor(dat, fs, bandsCuts=None, Nord=None, q=None):
     fs: the sampling freq of the dat
     bandsCuts: the cirtical freqs to use
     Nord: The order of the filter
+    lamb: parameter for smooth
     """
     if Nord is None:
         Nord = 10
@@ -39,10 +40,12 @@ def mat2Tensor(dat, fs, bandsCuts=None, Nord=None, q=None):
     if q is not None:
         filDats = signal.decimate(filDats, q=q)
     
-    X = filDats[:, :, :-1]
-    Y = filDats[:, :, 1:]
-    
-    return edict({"X":X, "Y":Y})
+    if is_raw:
+        return filDats
+    else:
+        X = filDats[:, :, :-1]
+        Y = filDats[:, :, 1:]
+        return edict({"X":X, "Y":Y})
 
 
 def GetAmatArr(Y, X, times, freqs, downrates=1, hs=None):
@@ -576,7 +579,7 @@ class TVDNextOpt():
             3. Decimate
         """
         dat = signal.detrend(self.rawDat)
-        cDat = mat2Tensor(dat, fs=self.fs, q=self.paras.q)
+        cDat = mat2Tensor(dat, fs=self.fs, q=self.paras.q, is_raw=False)
         # Avoid stride problem when convert numpy to tensor
         self.X = torch.tensor(cDat.X.copy())
         self.Y = torch.tensor(cDat.Y.copy())
@@ -780,3 +783,31 @@ def EpKernel(x, h=1):
     rv = 3/4/h * (1-xh**2)
     rv[np.abs(xh)>1] = 0
     return rv
+
+
+def GetBsplineEst(Ymat, time, lamb=1e-6):
+    """
+    Input:
+        Ymat: The observed data matrix, d x dT or d x dF x dT
+        time: A list of time points of length dT
+    return:
+        The estimated Xmat,  d x dT or d x dF x dT
+    """
+    sz = Ymat.shape
+    if len(sz) == 2:
+        d = sz[0]
+        eYmatlist = []
+        for i in range(d):
+            spres = smooth_spline_R(x=time, y=Ymat[i, :], lamb=lamb)
+            eYmatlist.append(spres)
+        eYmat = np.array(eYmatlist)
+    elif len(sz) == 3:
+        eYmat = np.zeros_like(Ymat)
+        d, dF, dT = sz
+        for i in range(d):
+            for j in range(dF):
+                spres = smooth_spline_R(x=time, y=Ymat[i, j, :], lamb=lamb)
+                eYmat[i, j, :] = spres
+    return eYmat
+
+
