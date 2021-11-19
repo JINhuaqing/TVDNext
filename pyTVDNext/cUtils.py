@@ -9,6 +9,7 @@ import seaborn as sns
 from tqdm.autonotebook import tqdm
 from pathlib import Path
 from collections import defaultdict as ddict
+import warnings
 import torch
 import time
 from Rfuns import bw_nrd0_R, smooth_spline_R
@@ -187,9 +188,10 @@ class OneStepOpt():
                  beta: tuning parameter for iteration
                  alp: tuning parameter for iteration
                  rho: a vector of length (D-1)2R, real data
-                 lam: the parameter for SCAD
+                 lam: the parameter for SCAD/Group lasso
                  a: the parameter for SCAD, > 1+1/beta
                  iterNum:  integer, number of iterations
+                           if iterNum < 0, optimization without penalty.
                  iterC: decimal, stopping rule
                  eps: decimal, stopping rule for conjugate gradient method
         """
@@ -300,6 +302,29 @@ class OneStepOpt():
         return xk
         
     
+    def updateVecGamNoPenalty(self):
+        """
+            Update the Gamma matrix without penalty, first step 
+        """
+        optAxis = 1 if self.D == self.dF else 0
+        
+        if self.leftMat is None:
+            NewXSq = self.NewXr**2 + self.NewXi**2 # dF x dT x R
+            NewXSqR2 = torch.cat((NewXSq, NewXSq), dim=2) # dF x dT x 2R
+            NewXSqR2Sum = NewXSqR2.sum(axis=optAxis) # dF x 2R or dT x 2R
+            self.leftMat = torch.diag(NewXSqR2Sum.flatten()/self.numEs).to_sparse()
+        
+        if self.NewXYR2Sum is None:
+            NewXY1 = self.NewXr * self.NewYr + self.NewXi * self.NewYi
+            NewXY2 = - self.NewXi * self.NewYr + self.NewXr * self.NewYi
+            NewXYR2 = torch.cat((NewXY1, NewXY2), dim=2) # dF x dT x 2R
+            self.NewXYR2Sum = NewXYR2.sum(axis=optAxis) # dF x 2R or dT x 2R
+        rightVec = self.NewXYR2Sum.flatten()/self.numEs
+        
+        self.newVecGam, _  = torch.solve(rightVec.reshape(-1, 1), self.leftMat.to_dense()) 
+        self.newVecGam = self.newVecGam.reshape(-1)
+        self.lastTheta = DiffMatOpt(self.newVecGam, self.R2) # In factor, this lastTheta is not useful when there is no penalty
+        
     def updateVecGam(self):
         """
             I use conjugate gradient to solve it. 
@@ -408,14 +433,11 @@ class OneStepOpt():
         newRho = self.halfRho - self.paras.alp * self.paras.beta * (DiffMatOpt(self.newVecGam, self.R2) - self.lastTheta)
         self.rho = newRho
         
-    
-    def __call__(self, is_showProg=False, leave=False):
-        if self.NewXr is None:
-            self.obtainNewData()
-        if self.iterC is None:
-            self.iterC = 0
         
-        chDiff = torch.tensor(1e10)
+    def OneLoop(self):
+        """
+        Run one loop for the opt
+        """
         
         if self.is_ConGrad:
             self.updateVecGamConGra()
@@ -430,51 +452,51 @@ class OneStepOpt():
             self.updateThetaGL()
             
         self.updateRho()
+    
+    def __call__(self, is_showProg=False, leave=False):
+        if self.NewXr is None:
+            self.obtainNewData()
         
-        lastVecGam = self.newVecGam
-        if is_showProg:
-            with tqdm(total=self.iterNum, leave=leave) as pbar:
+        if self.iterNum < 0:
+            """
+            No penalty
+            """
+            warnings.warn("As iterNum is negative, we do not include penalty which means the parameters of iterations are not used", 
+                          UserWarning)
+            self.updateVecGamNoPenalty()
+        else:
+            """
+            With penalty
+            """
+            if self.iterC is None:
+                self.iterC = 0
+            
+            chDiff = torch.tensor(1e10)
+            self.OneLoop()
+            
+            lastVecGam = self.newVecGam
+            if is_showProg:
+                with tqdm(total=self.iterNum, leave=leave) as pbar:
+                    for i in range(self.iterNum):
+                        pbar.set_description(f"Inner Loop: The chdiff is {chDiff.item():.3e}.")
+                        pbar.update(1)
+                        
+                        self.OneLoop()
+                        
+                        chDiff = torch.norm(self.newVecGam-lastVecGam)/torch.norm(lastVecGam)
+                        lastVecGam = self.newVecGam
+                        if chDiff < self.iterC:
+                            pbar.update(self.iterNum)
+                            break
+            else:
                 for i in range(self.iterNum):
-                    pbar.set_description(f"Inner Loop: The chdiff is {chDiff.item():.3e}.")
-                    pbar.update(1)
                     
-                    if self.is_ConGrad:
-                        self.updateVecGamConGra()
-                    else:
-                        self.updateVecGam()
-                        
-                    self.updateHRho()
+                    self.OneLoop()
                     
-                    if self.penalty.startswith("scad"):
-                        self.updateTheta()
-                    elif self.penalty.startswith("group"):
-                        self.updateThetaGL()
-                        
-                    self.updateRho()
                     chDiff = torch.norm(self.newVecGam-lastVecGam)/torch.norm(lastVecGam)
                     lastVecGam = self.newVecGam
                     if chDiff < self.iterC:
-                        pbar.update(self.iterNum)
                         break
-        else:
-            for i in range(self.iterNum):
-                if self.is_ConGrad:
-                    self.updateVecGamConGra()
-                else:
-                    self.updateVecGam()
-                    
-                self.updateHRho()
-                
-                if self.penalty.startswith("scad"):
-                    self.updateTheta()
-                elif self.penalty.startswith("group"):
-                    self.updateThetaGL()
-                
-                self.updateRho()
-                chDiff = torch.norm(self.newVecGam-lastVecGam)/torch.norm(lastVecGam)
-                lastVecGam = self.newVecGam
-                if chDiff < self.iterC:
-                    break
             
         self._post()
             
